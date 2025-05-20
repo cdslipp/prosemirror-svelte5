@@ -1,92 +1,111 @@
-<script>
-  import { onMount, onDestroy, createEventDispatcher } from 'svelte'
-  import { createSingleLineEditor } from './state'
+<script lang="ts">
   import { EditorView } from "prosemirror-view"
   import { EditorState } from "prosemirror-state"
+  import { createSingleLineEditor } from './state'
 
-  const dispatch = createEventDispatcher()
+  type ProsemirrorEditorProps = Partial<{
+    className: string
+    editorState: EditorState
+    placeholder: string
+    view: EditorView | null
+    debounceChangeEventsInterval: number
+    editorViewProps: Record<string, any>
+    onChange: (detail: { editorState: EditorState }) => void
+    onTransaction: (detail: { 
+      view: EditorView, 
+      editorState: EditorState, 
+      isDirty: boolean, 
+      contentHasChanged: boolean 
+    }) => void
+    onCustom: (detail: { type?: string, [key: string]: any }) => void
+    focusEditor: (() => void) | undefined
+  }>
 
-  /** @type string */
-  export let className = "ui-editor"
+  let { 
+    className = "ui-editor",
+    editorState: incomingEditorState = createSingleLineEditor(),
+    placeholder = '',
+    view: externalView = null,
+    debounceChangeEventsInterval = 50,
+    editorViewProps = {},
+    onChange,
+    onTransaction,
+    onCustom,
+    focusEditor = $bindable<(() => void) | undefined>(undefined)
+  } = $props()
 
-  /** @type EditorState */
-  export let editorState = createSingleLineEditor()
+  // State management with runes
+  let editorState = $state(incomingEditorState)
+  let view = $state<EditorView | null>(externalView)
+  let isDirty = $state(false)
+  let dispatchLastEditTimeout = $state<ReturnType<typeof setTimeout> | null>(null)
+  let editor = $state<HTMLDivElement | null>(null)
 
-  /** @type string */
-  export let placeholder = ''
+  // Derived state
+  let editorIsEmpty = $derived(
+    editorState 
+      ? editorState.doc.content.size === 0 || 
+        (editorState.doc.textContent === "" && editorState.doc.content.size < 3)
+      : true
+  )
 
-  /** Reference to the editor view
-   *  @type EditorView|null */
-  export let view = null
-
-  /** Debounce change events (set to zero for immediate updates) */
-  export let debounceChangeEventsInterval = 50
-
-  /** Reference to the editor component
-   *  @type HTMLDivElement */
-  export let editor = null
-
-  /** Initial EditorView props */
-  export let editorViewProps = {}
-
-  /** Focus the content-editable div */
-  export function focus() {
-    view && view.focus()
+  // Methods
+  function focus() {
+    view?.focus()
   }
 
-  /** Blur the content-editable div */
+  // Update the bindable focusEditor prop
+  $effect(() => {
+    focusEditor = focus
+  })
+
   export function blur() {
-    editor && editor.blur()
+    editor?.blur()
   }
 
-  /** Tracks the timeout id of the last time the change event was dispatched */
-  let dispatchLastEditTimeout
-
-  /** Tracks whether changes to editor state were not yet dispatched */
-  let isDirty = false
-
-  $: if (view && editorState && !isDirty) {
-    view.updateState(editorState) // necessary to keep the DOM in sync with the editor state on external updates
-  }
-
-  /** Tracks whether the editor is empty (i.e. has a content size of 0) */
-  let editorIsEmpty
-  $: editorIsEmpty = editorState ? editorState.doc.content.size === 0
-    || (editorState.doc.textContent === "" && editorState.doc.content.size < 3) : true
-
-  /** Dispatches a change event and resets whether the editor state is dirty */
-  const dispatchChangeEvent = () => {
+  // Event handlers
+  function dispatchChangeEvent() {
     if (isDirty) {
-      dispatch('change', {editorState})
+      onChange?.({ editorState })
       isDirty = false
     }
   }
 
-  /**
-   * Captures custom events from plugins and dispatches them with a new event type (based on event.detail.type)
-   * @param event {CustomEvent}
-   */
-  const onCustomEvent = event => {
-    if (event.detail) {
-      const {type, ...detail} = event.detail
-      dispatch(type || 'custom', detail)
-    }
-  }
+  // Set up custom event listener
+  $effect(() => {
+    if (!editor || !onCustom) return
 
-  onMount(() => {
-    view = new EditorView({mount: editor}, {
-        ...editorViewProps,
+    const handleCustomEvent = (event: CustomEvent) => {
+      if (event.detail) {
+        const { type, ...detail } = event.detail
+        onCustom({ type, ...detail })
+      }
+    }
+
+    editor.addEventListener('custom', handleCustomEvent as EventListener)
+    return () => editor.removeEventListener('custom', handleCustomEvent as EventListener)
+  })
+
+  // Editor initialization and cleanup
+  $effect(() => {
+    if (!editor) return
+
+    view = new EditorView({ mount: editor }, {
+      ...editorViewProps,
       state: editorState,
       dispatchTransaction: (transaction) => {
-        editorState = view.state.apply(transaction)
+        if (!view) return
 
-        const contentHasChanged = !editorState.doc.eq(view.state.doc)
+        const newState = view.state.apply(transaction)
+        const contentHasChanged = !newState.doc.eq(view.state.doc)
+
+        editorState = newState
 
         if (contentHasChanged) {
           isDirty = true
           if (debounceChangeEventsInterval > 0) {
             if (dispatchLastEditTimeout) clearTimeout(dispatchLastEditTimeout)
-            dispatchLastEditTimeout = setTimeout(dispatchChangeEvent, 50)
+            dispatchLastEditTimeout = setTimeout(dispatchChangeEvent, debounceChangeEventsInterval)
           } else {
             setTimeout(dispatchChangeEvent, 0)
           }
@@ -94,26 +113,32 @@
 
         view.updateState(editorState)
 
-        dispatch('transaction', {view, editorState, isDirty, contentHasChanged})
-      },
+        onTransaction?.({ view, editorState, isDirty, contentHasChanged })
+      }
     })
+
+    return () => {
+      view?.destroy()
+    }
   })
 
-  onDestroy(() => {
-    view.destroy()
+  // Sync external editor state changes
+  $effect(() => {
+    if (view && editorState && !isDirty) {
+      view.updateState(editorState)
+    }
   })
-
 </script>
 
-<div class={className}
-     class:ProseMirror={true}
-     class:editor_empty={editorIsEmpty}
-     data-placeholder={placeholder}
-     bind:this={editor}
-     on:focus
-     on:blur
-     on:keydown
-     on:custom={onCustomEvent}
+<div 
+  class={className}
+  class:ProseMirror={true}
+  class:editor_empty={editorIsEmpty}
+  data-placeholder={placeholder}
+  bind:this={editor}
+  on:focus={() => {}}
+  on:blur={() => {}}
+  on:keydown={() => {}}
 ></div>
 
 <style>
